@@ -745,23 +745,12 @@
     document.getElementById('worksummary-end').value = todayIso();
 
     /* ---------- dashboard ---------- */
-    async function loadDashboard() {
-      setStatus('dashboard-status', 'Loading dashboard…', 'loading');
-
-      var start = daysAgoIso(30);
-      var end = todayIso();
-
-      // One request, not four: each report has to scan every zone tab, and
-      // Sheets reads are slow enough that four round trips is visibly worse.
-      var summary;
-      try {
-        summary = await api('getDashboard', { start: start, end: end });
-      } catch (err) {
-        setStatus('dashboard-status', 'Error: ' + err.message, 'error');
-        return;
-      }
-      setStatus('dashboard-status', '', '');
-
+    // The last dashboard is kept in this browser and shown immediately while
+    // the current numbers load, so the page is never blank. `fresh` (the
+    // Refresh button) also makes the server re-read the sheets instead of
+    // using its cache.
+    var DASH_CACHE_KEY = 'attendance.dashboard.v1';
+    function renderDashboard(summary) {
       var tiles = document.querySelectorAll('#dashboard-tiles .stat-tile .value');
       tiles[0].textContent = summary.employee_count || 0;
       var resigned = summary.resigned_count || 0;
@@ -781,7 +770,34 @@
       var table = leaveRowsToTable(summary.leave_recent || []);
       renderTable('dashboard-recent-table', table.headers, table.rows, { 4: zoneBadge });
     }
-    document.getElementById('refresh-dashboard-btn').addEventListener('click', loadDashboard);
+
+    async function loadDashboard(fresh) {
+      var start = daysAgoIso(30);
+      var end = todayIso();
+
+      var cachedSummary = null;
+      try { cachedSummary = JSON.parse(localStorage.getItem(DASH_CACHE_KEY) || 'null'); } catch (e) {}
+      if (cachedSummary) {
+        renderDashboard(cachedSummary);
+        setStatus('dashboard-status', 'Showing the last saved numbers — updating…', 'loading');
+      } else {
+        setStatus('dashboard-status', 'Loading dashboard…', 'loading');
+      }
+
+      // One request, not four: each report has to scan every zone tab, and
+      // Sheets reads are slow enough that four round trips is visibly worse.
+      var summary;
+      try {
+        summary = await api('getDashboard', { start: start, end: end, fresh: fresh === true });
+      } catch (err) {
+        setStatus('dashboard-status', (cachedSummary ? 'Could not update (showing saved numbers): ' : 'Error: ') + err.message, 'error');
+        return;
+      }
+      setStatus('dashboard-status', '', '');
+      try { localStorage.setItem(DASH_CACHE_KEY, JSON.stringify(summary)); } catch (e) {}
+      renderDashboard(summary);
+    }
+    document.getElementById('refresh-dashboard-btn').addEventListener('click', function () { loadDashboard(true); });
     loadDashboard();
 
     /* ---------- export helpers (CSV download + copy) ---------- */
