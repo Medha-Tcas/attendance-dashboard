@@ -311,9 +311,8 @@
       </form>
 
       <p style="font-size:12px; color:var(--muted); margin:-8px 0 12px;">
-        Skipped automatically: every <strong>Sunday</strong>, the <strong>3rd Saturday</strong> of each
-        month, and <strong>public holidays</strong>. Employees marked Resigned, and anyone with leave
-        covering the date, are excluded too.
+        Skipped automatically: every <strong>Sunday</strong> and <strong>public holidays</strong>.
+        Employees marked Resigned, and anyone with leave covering the date, are excluded too.
         <span id="holiday-coverage"></span>
       </p>
 
@@ -574,6 +573,86 @@
       var el = document.getElementById(elId);
       el.textContent = text || '';
       el.className = 'status-line' + (kind ? ' ' + kind : '');
+    }
+
+    /* ---------- large-report helpers ----------
+       A month of entries is too much for one request: it is slow, can hit
+       Apps Script's time limit, and a big reply is more likely to be dropped
+       on a restricted network. So a long date range is split into weekly
+       chunks, fetched a few at a time, retried once on failure, and merged.
+       Only a preview is drawn in the page; Download CSV / Copy use every row. */
+    var CHUNK_DAYS = 7;          // days per request
+    var CHUNK_PARALLEL = 3;      // requests in flight at once
+    var PREVIEW_LIMIT = 500;     // table rows drawn in the page
+
+    function addDaysIso(iso, n) {
+      var p = iso.split('-');
+      return new Date(Date.UTC(+p[0], +p[1] - 1, +p[2] + n)).toISOString().slice(0, 10);
+    }
+
+    function splitRange(start, end) {
+      if (!start || !end || start > end) return [[start || null, end || null]];
+      var chunks = [];
+      var s = start;
+      while (s <= end) {
+        var e = addDaysIso(s, CHUNK_DAYS - 1);
+        if (e > end) e = end;
+        chunks.push([s, e]);
+        s = addDaysIso(e, 1);
+      }
+      return chunks;
+    }
+
+    function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+    async function getEntriesWithRetry(params) {
+      try {
+        return await api('getEntries', params);
+      } catch (err) {
+        await sleep(1200);
+        return await api('getEntries', params);   // second failure is reported
+      }
+    }
+
+    async function fetchEntriesChunked(params, onProgress) {
+      var chunks = splitRange(params.start, params.end);
+      var results = new Array(chunks.length);
+      var next = 0, done = 0, failure = null;
+
+      async function worker() {
+        while (!failure) {
+          var i = next++;
+          if (i >= chunks.length) return;
+          try {
+            results[i] = await getEntriesWithRetry({ start: chunks[i][0], end: chunks[i][1], zone: params.zone });
+          } catch (err) {
+            failure = err;
+            return;
+          }
+          done++;
+          if (onProgress) onProgress(done, chunks.length);
+        }
+      }
+
+      var workers = [];
+      for (var w = 0; w < Math.min(CHUNK_PARALLEL, chunks.length); w++) workers.push(worker());
+      await Promise.all(workers);
+      if (failure) throw failure;
+
+      // Same order the backend uses: zone, newest date first, then name.
+      return [].concat.apply([], results).sort(function (a, b) {
+        if (a.current_working_section !== b.current_working_section) {
+          return a.current_working_section.localeCompare(b.current_working_section);
+        }
+        if (a.entry_date !== b.entry_date) return (a.entry_date || '') < (b.entry_date || '') ? 1 : -1;
+        return (a.employee_name || '').localeCompare(b.employee_name || '');
+      });
+    }
+
+    function previewNote(total) {
+      return total > PREVIEW_LIMIT
+        ? ' Showing the first ' + PREVIEW_LIMIT + ' — use Download CSV for all ' + total + '.'
+        : '';
     }
 
     // Zone/section columns always render as a dark badge, like the zone pill in
@@ -988,10 +1067,12 @@
 
       var data;
       try {
-        data = await api('getEntries', {
+        data = await fetchEntriesChunked({
           start: document.getElementById('entries-start').value || null,
           end: document.getElementById('entries-end').value || null,
           zone: document.getElementById('entries-zone').value || null
+        }, function (done, total) {
+          if (total > 1) setStatus('entries-status', 'Loading entries… part ' + done + ' of ' + total, 'loading');
         });
       } catch (err) {
         btn.disabled = false;
@@ -1002,8 +1083,8 @@
       btn.disabled = false;
 
       var table = entriesRowsToTable(data);
-      setStatus('entries-status', data.length + ' entr' + (data.length === 1 ? 'y' : 'ies') + ' found.', 'success');
-      renderTable('entries-table', table.headers, table.rows, { 1: zoneBadge, 11: workStatusBadge });
+      setStatus('entries-status', data.length + ' entr' + (data.length === 1 ? 'y' : 'ies') + ' found.' + previewNote(table.rows.length), 'success');
+      renderTable('entries-table', table.headers, table.rows.slice(0, PREVIEW_LIMIT), { 1: zoneBadge, 11: workStatusBadge });
       lastEntriesResult = table;
       document.getElementById('entries-download-btn').disabled = table.rows.length === 0;
       document.getElementById('entries-copy-btn').disabled = table.rows.length === 0;
@@ -1035,10 +1116,12 @@
 
       var data;
       try {
-        data = await api('getEntries', {
+        data = await fetchEntriesChunked({
           start: document.getElementById('worksummary-start').value || null,
           end: document.getElementById('worksummary-end').value || null,
           zone: document.getElementById('worksummary-zone').value || null
+        }, function (done, total) {
+          if (total > 1) setStatus('worksummary-status', 'Loading… part ' + done + ' of ' + total, 'loading');
         });
       } catch (err) {
         btn.disabled = false;
@@ -1049,8 +1132,8 @@
       btn.disabled = false;
 
       var table = workSummaryRowsToTable(data);
-      setStatus('worksummary-status', table.rows.length + ' work record(s) found.', 'success');
-      renderTable('worksummary-table', table.headers, table.rows, { 1: zoneBadge, 6: workStatusBadge });
+      setStatus('worksummary-status', table.rows.length + ' work record(s) found.' + previewNote(table.rows.length), 'success');
+      renderTable('worksummary-table', table.headers, table.rows.slice(0, PREVIEW_LIMIT), { 1: zoneBadge, 6: workStatusBadge });
       renderBarChart('chart-worksummary-status', statusBySectionCounts(table.raw), '');
       lastWorkSummaryResult = table;
       document.getElementById('worksummary-download-btn').disabled = table.rows.length === 0;
